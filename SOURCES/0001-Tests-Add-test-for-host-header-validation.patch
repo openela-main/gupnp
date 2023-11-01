@@ -1,0 +1,180 @@
+From 125e957092083ea37cf8ac712fa62587e3817242 Mon Sep 17 00:00:00 2001
+From: Jens Georg <mail@jensge.org>
+Date: Mon, 10 May 2021 11:45:57 +0200
+Subject: [PATCH] Tests: Add test for host header validation
+
+---
+ libgupnp/gupnp-context-private.h |  5 ++
+ libgupnp/gupnp-context.c         | 25 ++++++++--
+ tests/gtest/test-bugs.c          | 78 ++++++++++++++++++++++++++++++--
+ 3 files changed, 99 insertions(+), 9 deletions(-)
+
+diff --git a/libgupnp/gupnp-context-private.h b/libgupnp/gupnp-context-private.h
+index 5848d02..a8b4a75 100644
+--- a/libgupnp/gupnp-context-private.h
++++ b/libgupnp/gupnp-context-private.h
+@@ -42,6 +42,11 @@ gupnp_context_ip_is_ours (GUPnPContext *context, const char *address);
+ G_GNUC_INTERNAL gboolean
+ gupnp_context_validate_host_header (GUPnPContext *context, const char *host);
+ 
++gboolean
++validate_host_header (const char *host_header,
++                      const char *host_ip,
++                      guint context_port);
++
+ G_END_DECLS
+ 
+ #endif /* __GUPNP_CONTEXT_PRIVATE_H__ */
+diff --git a/libgupnp/gupnp-context.c b/libgupnp/gupnp-context.c
+index 0381474..ec88b93 100644
+--- a/libgupnp/gupnp-context.c
++++ b/libgupnp/gupnp-context.c
+@@ -1585,9 +1585,11 @@ out:
+ }
+ 
+ gboolean
+-gupnp_context_validate_host_header (GUPnPContext *context,
+-                                    const char *host_header)
++validate_host_header (const char *host_header,
++                      const char *host_ip,
++                      guint context_port)
+ {
++
+         gboolean retval = FALSE;
+         // Be lazy and let GUri do the heavy lifting here, such as stripping the
+         // [] from v6 addresses, splitting of the port etc.
+@@ -1610,8 +1612,11 @@ gupnp_context_validate_host_header (GUPnPContext *context,
+                 goto out;
+         }
+ 
+-        const char *host_ip = gssdp_client_get_host_ip (GSSDP_CLIENT (context));
+-        gint context_port = gupnp_context_get_port (context);
++        // -1 means there was no :port; according to UDA this is allowed and
++        // defaults to 80, the HTTP port then
++        if (port == -1) {
++                port = 80;
++        }
+ 
+         if (!g_str_equal (host, host_ip)) {
+                 g_debug ("Mismatch between host header and host IP (%s, "
+@@ -1631,6 +1636,18 @@ gupnp_context_validate_host_header (GUPnPContext *context,
+ 
+ out:
+         g_clear_error (&error);
++        g_free (host);
+         g_free (uri_from_host);
++
+         return retval;
+ }
++
++gboolean
++gupnp_context_validate_host_header (GUPnPContext *context,
++                                    const char *host_header)
++{
++        return validate_host_header (
++                host_header,
++                gssdp_client_get_host_ip (GSSDP_CLIENT (context)),
++                gupnp_context_get_port (context));
++}
+diff --git a/tests/gtest/test-bugs.c b/tests/gtest/test-bugs.c
+index 0ffac76..24ec4ba 100644
+--- a/tests/gtest/test-bugs.c
++++ b/tests/gtest/test-bugs.c
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ #include <libgupnp/gupnp.h>
++#include <libgupnp/gupnp-context-private.h>
+ 
+ 
+ struct _GUPnPServiceAction {
+@@ -468,14 +469,81 @@ test_bgo_743233 (void)
+     g_object_unref (context);
+ }
+ 
++static void
++test_ggo_24 (void)
++{
++        // IPv4
++        g_assert (
++                validate_host_header ("127.0.0.1:4711", "127.0.0.1", 4711));
++
++        g_assert (
++                validate_host_header ("127.0.0.1", "127.0.0.1", 80));
++
++        g_assert_false (
++                validate_host_header ("example.com", "127.0.0.1", 4711));
++
++        g_assert_false (
++                validate_host_header ("example.com:80", "127.0.0.1", 4711));
++
++        g_assert_false (
++                validate_host_header ("example.com:4711", "127.0.0.1", 4711));
++
++        g_assert_false (
++                validate_host_header ("192.168.1.2:4711", "127.0.0.1", 4711));
++
++        g_assert_false (
++                validate_host_header ("[fe80::01]", "127.0.0.1", 4711));
++
++        // Link ids should not be parsed
++        g_assert_false (
++                validate_host_header ("[fe80::01%1]", "127.0.0.1", 4711));
++
++        g_assert_false (
++                validate_host_header ("[fe80::01%eth0]", "127.0.0.1", 4711));
++
++        // IPv6
++        g_assert (
++                validate_host_header ("[::1]:4711", "::1", 4711));
++
++        g_assert (
++                validate_host_header ("[::1]", "::1", 80));
++
++        // Host header needs to be enclosed in [] even without port
++        g_assert_false (
++                validate_host_header ("::1", "::1", 80));
++
++        g_assert_false (
++                validate_host_header ("example.com", "::1", 4711));
++
++        g_assert_false (
++                validate_host_header ("example.com:80", "::1", 4711));
++
++        g_assert_false (
++                validate_host_header ("example.com:4711", "::1", 4711));
++
++        g_assert_false (
++                validate_host_header ("192.168.1.2:4711", "::1", 4711));
++
++        g_assert_false (
++                validate_host_header ("[fe80::01]", "::1", 4711));
++
++        // Link ids should not be parsed
++        g_assert_false (
++                validate_host_header ("[fe80::01%1]", "fe80::acab", 4711));
++
++        g_assert_false (
++                validate_host_header ("[fe80::01%eth0]", "fe80::acab", 4711));
++}
++
+ int
+ main (int argc, char *argv[]) {
+     g_test_init (&argc, &argv, NULL);
+-    g_test_add_func ("/bugs/696762", test_bgo_696762);
+-    g_test_add_func ("/bugs/678701", test_bgo_678701);
+-    g_test_add_func ("/bugs/690400", test_bgo_690400);
+-    g_test_add_func ("/bugs/722696", test_bgo_722696);
+-    g_test_add_func ("/bugs/743233", test_bgo_743233);
++    g_test_add_func ("/bugs/bgo/696762", test_bgo_696762);
++    g_test_add_func ("/bugs/bgo/678701", test_bgo_678701);
++    g_test_add_func ("/bugs/bgo/690400", test_bgo_690400);
++    g_test_add_func ("/bugs/bgo/722696", test_bgo_722696);
++    g_test_add_func ("/bugs/bgo/743233", test_bgo_743233);
++    g_test_add_func ("/bugs/ggo/24", test_ggo_24);
+ 
+     return g_test_run ();
+ }
+-- 
+2.31.1
+
